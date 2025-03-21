@@ -44,6 +44,7 @@ import (
 	"github.com/FerretDB/FerretDB/v2/internal/clientconn/conninfo"
 	"github.com/FerretDB/FerretDB/v2/internal/clientconn/connmetrics"
 	"github.com/FerretDB/FerretDB/v2/internal/handler"
+	"github.com/FerretDB/FerretDB/v2/internal/handler/middleware"
 	"github.com/FerretDB/FerretDB/v2/internal/handler/proxy"
 	"github.com/FerretDB/FerretDB/v2/internal/mongoerrors"
 	"github.com/FerretDB/FerretDB/v2/internal/util/lazyerrors"
@@ -220,92 +221,103 @@ func (c *conn) run(ctx context.Context) (err error) {
 	}()
 
 	for {
-		var reqHeader *wire.MsgHeader
-		var reqBody wire.MsgBody
-		var resHeader *wire.MsgHeader
-		var resBody wire.MsgBody
-
-		reqHeader, reqBody, err = wire.ReadMessage(bufr)
-		if err != nil {
-			return
-		}
-
-		if c.l.Enabled(ctx, slog.LevelDebug) {
-			c.l.DebugContext(ctx, "Request header: "+reqHeader.String())
-			c.l.DebugContext(ctx, "Request message:\n"+reqBody.StringIndent())
-		}
-
-		// diffLogLevel provides the level of logging for the diff between the "normal" and "proxy" responses.
-		// It is set to the highest level of logging used to log response.
-		diffLogLevel := slog.LevelDebug
-
-		// send request to proxy first (unless we are in normal mode)
-		// because FerretDB's handling could modify reqBody's documents,
-		// creating a data race
-		var proxyHeader *wire.MsgHeader
-		var proxyBody wire.MsgBody
-		if c.mode != NormalMode {
-			if c.proxy == nil {
-				panic("proxy addr was nil")
-			}
-
-			// TODO https://github.com/FerretDB/FerretDB/issues/1997
-			proxyHeader, proxyBody = c.proxy.Route(ctx, reqHeader, reqBody)
-		}
-
-		// handle request unless we are in proxy mode
-		var resCloseConn bool
-		if c.mode != ProxyMode {
-			resHeader, resBody, resCloseConn = c.route(ctx, reqHeader, reqBody)
-			if level := c.logResponse(ctx, "Response", resHeader, resBody, resCloseConn); level > diffLogLevel {
-				diffLogLevel = level
-			}
-		}
-
-		// log proxy response after the normal response to make it less confusing
-		if c.mode != NormalMode {
-			if level := c.logResponse(ctx, "Proxy response", proxyHeader, proxyBody, false); level > diffLogLevel {
-				diffLogLevel = level
-			}
-		}
-
-		// diff in diff mode
-		if c.l.Enabled(ctx, diffLogLevel) && (c.mode == DiffNormalMode || c.mode == DiffProxyMode) {
-			if err = c.logDiff(ctx, resHeader, proxyHeader, resBody, proxyBody, diffLogLevel); err != nil {
-				return
-			}
-		}
-
-		// replace response with one from proxy in proxy and diff-proxy modes
-		if c.mode == ProxyMode || c.mode == DiffProxyMode {
-			resHeader = proxyHeader
-			resBody = proxyBody
-		}
-
-		if resHeader == nil || resBody == nil {
-			panic("no response to send to client")
-		}
-
-		if err = wire.WriteMessage(bufw, resHeader, resBody); err != nil {
-			c.l.DebugContext(ctx, "Failed to write message", logging.Error(err))
-
-			return
-		}
-
-		if err = bufw.Flush(); err != nil {
-			c.l.DebugContext(ctx, "Failed to flush buffer", logging.Error(err))
-
-			return
-		}
-
-		if resCloseConn {
-			err = errors.New("fatal error")
-
-			c.l.DebugContext(ctx, "Connection closed unexpectedly", logging.Error(err))
-
+		if err = c.processMessage(ctx, bufr, bufw); err != nil {
 			return
 		}
 	}
+}
+
+// processMessage reads the request, routes the request based on the operation mode
+// and writes the response.
+//
+// Any error returned indicates the connection should be closed.
+func (c *conn) processMessage(ctx context.Context, bufr *bufio.Reader, bufw *bufio.Writer) error {
+	reqHeader, reqBody, err := wire.ReadMessage(bufr)
+	if err != nil {
+		return err
+	}
+
+	if c.l.Enabled(ctx, slog.LevelDebug) {
+		c.l.DebugContext(ctx, "Request header: "+reqHeader.String())
+		c.l.DebugContext(ctx, "Request message:\n"+reqBody.StringIndent())
+	}
+
+	// diffLogLevel provides the level of logging for the diff between the "normal" and "proxy" responses.
+	// It is set to the highest level of logging used to log response.
+	diffLogLevel := slog.LevelDebug
+
+	// send request to proxy first (unless we are in normal mode)
+	// because FerretDB's handling could modify reqBody's documents,
+	// creating a data race
+	var proxyHeader *wire.MsgHeader
+	var proxyBody wire.MsgBody
+
+	if c.mode != NormalMode {
+		if c.proxy == nil {
+			panic("proxy addr was nil")
+		}
+
+		// TODO https://github.com/FerretDB/FerretDB/issues/1997
+		proxyHeader, proxyBody = c.proxy.Route(ctx, reqHeader, reqBody)
+	}
+
+	// handle request unless we are in proxy mode
+	var resCloseConn bool
+	var resHeader *wire.MsgHeader
+	var resBody wire.MsgBody
+
+	if c.mode != ProxyMode {
+		resHeader, resBody, resCloseConn = c.route(ctx, reqHeader, reqBody)
+		if level := c.logResponse(ctx, "Response", resHeader, resBody, resCloseConn); level > diffLogLevel {
+			diffLogLevel = level
+		}
+	}
+
+	// log proxy response after the normal response to make it less confusing
+	if c.mode != NormalMode {
+		if level := c.logResponse(ctx, "Proxy response", proxyHeader, proxyBody, false); level > diffLogLevel {
+			diffLogLevel = level
+		}
+	}
+
+	// diff in diff mode
+	if c.l.Enabled(ctx, diffLogLevel) && (c.mode == DiffNormalMode || c.mode == DiffProxyMode) {
+		if err = c.logDiff(ctx, resHeader, proxyHeader, resBody, proxyBody, diffLogLevel); err != nil {
+			return err
+		}
+	}
+
+	// replace response with one from proxy in proxy and diff-proxy modes
+	if c.mode == ProxyMode || c.mode == DiffProxyMode {
+		resHeader = proxyHeader
+		resBody = proxyBody
+	}
+
+	if resHeader == nil || resBody == nil {
+		panic("no response to send to client")
+	}
+
+	if err = wire.WriteMessage(bufw, resHeader, resBody); err != nil {
+		c.l.DebugContext(ctx, "Failed to write message", logging.Error(err))
+
+		return err
+	}
+
+	if err = bufw.Flush(); err != nil {
+		c.l.DebugContext(ctx, "Failed to flush buffer", logging.Error(err))
+
+		return err
+	}
+
+	if resCloseConn {
+		err = errors.New("fatal error")
+
+		c.l.DebugContext(ctx, "Connection closed unexpectedly", logging.Error(err))
+
+		return err
+	}
+
+	return nil
 }
 
 // route sends request to a handler's command based on the op code provided in the request header.
@@ -375,7 +387,7 @@ func (c *conn) route(connCtx context.Context, reqHeader *wire.MsgHeader, reqBody
 		connCtx, span = otel.Tracer("").Start(connCtx, "")
 
 		if err == nil {
-			resBody = c.handleOpMsg(connCtx, msg, command)
+			resBody = c.handleOpMsg(connCtx, &middleware.MsgRequest{OpMsg: msg}, command)
 		}
 
 	case wire.OpCodeQuery:
@@ -386,11 +398,17 @@ func (c *conn) route(connCtx context.Context, reqHeader *wire.MsgHeader, reqBody
 
 		// do not store typed nil in interface, it makes it non-nil
 
-		var resReply *wire.OpReply
-		resReply, err = c.h.CmdQuery(connCtx, query)
+		o := &middleware.Observability{
+			L: logging.WithName(c.l, "observability"),
+		}
 
-		if resReply != nil {
-			resBody = resReply
+		replyHandler := o.HandleOpReply(c.h.CmdQuery)
+
+		var reply *middleware.ReplyResponse
+		reply, err = replyHandler(connCtx, &middleware.QueryRequest{OpQuery: query})
+
+		if reply != nil && reply.OpReply != nil {
+			resBody = reply.OpReply
 		}
 
 	case wire.OpCodeReply:
@@ -501,7 +519,7 @@ func (c *conn) route(connCtx context.Context, reqHeader *wire.MsgHeader, reqBody
 // handleOpMsg processes OP_MSG requests.
 //
 // The passed context is canceled when the client disconnects.
-func (c *conn) handleOpMsg(connCtx context.Context, msg *wire.OpMsg, command string) *wire.OpMsg {
+func (c *conn) handleOpMsg(connCtx context.Context, msg *middleware.MsgRequest, command string) *middleware.MsgResponse {
 	cmd, ok := c.h.Commands()[command]
 	if !ok || cmd.Handler == nil {
 		err := mongoerrors.New(
@@ -509,12 +527,12 @@ func (c *conn) handleOpMsg(connCtx context.Context, msg *wire.OpMsg, command str
 			fmt.Sprintf("no such command: '%s'", command),
 		)
 
-		return mongoerrors.Make(connCtx, err, "", c.l).Msg()
+		return must.NotFail(middleware.Response(mongoerrors.Make(connCtx, err, "", c.l).Doc()))
 	}
 
 	res, err := cmd.Handler(connCtx, msg)
 	if err != nil {
-		return mongoerrors.Make(connCtx, err, "", c.l).Msg()
+		return must.NotFail(middleware.Response(mongoerrors.Make(connCtx, err, "", c.l).Doc()))
 	}
 
 	return res
@@ -563,12 +581,13 @@ func (c *conn) logResponse(ctx context.Context, who string, resHeader *wire.MsgH
 	level := slog.LevelDebug
 
 	if resHeader.OpCode == wire.OpCodeMsg {
-		msg := resBody.(*wire.OpMsg)
+		msg, ok := resBody.(*wire.OpMsg)
+		if !ok {
+			msg = resBody.(*middleware.MsgResponse).OpMsg
+		}
 
 		raw := msg.RawSection0()
 		doc, _ := raw.Decode()
-
-		var ok bool
 
 		if doc != nil {
 			switch v := doc.Get("ok").(type) {
